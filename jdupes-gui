@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk
+	
+
+def num_bytes_to_human_string(num, suffix='B'):
+    for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
+        if abs(num) < 1024.0:
+            return "%3.2f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.2f%s%s" % (num, 'Yi', suffix)
+
+def files_and_size_to_string(numfiles, total_size):
+    return str(numfiles) + " files, " + num_bytes_to_human_string(total_size) + " total"
+
+
+class FirstSection(Gtk.Box):
+    def __init__(self, mainwindow):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        self.update_run_btt_callback = self.dummy
+        self.mainwindow = mainwindow
+
+
+        self.list_store = Gtk.ListStore(bool, str)
+        self.list_view = Gtk.TreeView(model=self.list_store)
+
+        view_toggle_button = Gtk.CellRendererToggle()
+        view_toggle_button.connect("toggled", self.on_cell_toggled)
+        view_toggle_column = Gtk.TreeViewColumn("Recurse", view_toggle_button, active=0)
+        self.list_view.append_column(view_toggle_column)
+
+        view_folder_column = Gtk.TreeViewColumn("Folder", Gtk.CellRendererText(), text=1)
+        self.list_view.append_column(view_folder_column)
+
+        self.list_view.get_selection().connect("changed", self.on_view_selection_changed)
+
+        view_scrollable = Gtk.ScrolledWindow()
+        view_scrollable.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        view_scrollable.add(self.list_view)
+
+        self.pack_start(view_scrollable, True, True, 0)
+
+        btt_box = Gtk.Box()
+
+        add_button = Gtk.Button(label="Add Folder")
+        add_button.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
+        add_button.connect("clicked", self.add_folder_clicked)
+        btt_box.pack_end(add_button, False, True, 0)
+
+        self.remove_button = Gtk.Button(label="Remove Folder")
+        self.remove_button.connect("clicked", self.remove_folder_click)
+        self.remove_button.set_sensitive(False)
+        btt_box.pack_start(self.remove_button, False, True, 0)
+
+        self.pack_end(btt_box, False, True, 0)
+
+
+    def dummy():
+        pass
+
+
+    def on_cell_toggled(self, widget, path):
+        self.list_store[path][0] = not self.list_store[path][0]
+
+
+    def on_view_selection_changed(self, selection):
+        model, treeiter = selection.get_selected()
+        if treeiter is not None:
+            self.remove_button.set_sensitive(True)
+        else:
+            self.remove_button.set_sensitive(False)
+
+
+    def add_folder_clicked(self, widget):
+        dialog = Gtk.FileChooserDialog(
+            title="Please choose a folder",
+            parent=self.mainwindow,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK
+        )
+
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            
+            newfilename = dialog.get_filename()
+            dialog.destroy()
+
+            alerady_present = False
+            for row in self.list_store:
+                if row[1] == newfilename:
+                    alerady_present = True
+                    break
+
+            if alerady_present:
+                warning = Gtk.MessageDialog(
+                    transient_for=self.mainwindow,
+                    flags=0,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.CANCEL,
+                    text="This folder has already been selected",
+                )
+                warning.run()
+                warning.destroy()
+            else: 
+                self.list_store.append([True, newfilename])
+
+        elif response == Gtk.ResponseType.CANCEL:
+            dialog.destroy()
+
+        self.update_run_btt_callback()
+
+
+    def remove_folder_click(self, widget):
+        selection = self.list_view.get_selection()
+        tree, treeiter = selection.get_selected()
+        if treeiter is not None:
+            tree.remove(treeiter)
+
+        self.update_run_btt_callback()
+
+
+
+class SecondSection(Gtk.Box):
+    def __init__(self, first, third):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        self.first_box = first
+        self.third_box = third
+
+        self.first_box.update_run_btt_callback = self.update_run_button_enable
+
+        chkboxes = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        chkboxes.props.margin_left = 10
+        chkboxes.props.margin_top = 10
+
+        self.opt_onefs = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_onefs, "one-file-system", "do not match files on different filesystems/devices"))
+
+        self.opt_nohidden = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_nohidden, "no-hidden", "exclude hidden files from consideration"))
+
+        self.opt_hardlinks = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_hardlinks, "hard-links", "treat any linked files as duplicate files. Normally \nlinked files are treated as non-duplicates for safety"))
+
+        self.opt_isolate = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_isolate, "isolate", "files in the same specified directory won't match. This option attempts to block matches that are contained in \nthe same specified directory parameter on the command line. Due to the underlying nature of the jdupes algorithm, \na lot of matches will be blocked by this option that probably should not be. This code could use improvement."))
+
+        self.opt_permissions = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_permissions, "permissions", "don't consider files with different owner/group or \npermission bits as duplicates"))
+
+        self.opt_symlinks = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_symlinks, "symlinks", "follow symlinks. This option will treat symlinked files as regular files, but direct symlinks will be treated \nas if they are hard linked files and the -H/--hard-links option will apply to them in the same manner."))
+
+        self.opt_zeromatch = Gtk.CheckButton()
+        chkboxes.add(self.generate_option(self.opt_zeromatch, "zero-match", "consider zero-length files to be duplicates"))
+
+        self.pack_start(chkboxes, False, True, 0)
+        
+        btt_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.cp_cmd_btt = Gtk.Button(label="Copy command to clipboard")
+        self.cp_cmd_btt.set_sensitive(False)
+        self.cp_cmd_btt.connect("clicked", self.copy_command_button_clicked)
+        btt_box.pack_start(self.cp_cmd_btt, False, True, 0)
+
+        self.run_btt = Gtk.Button(label="Run jdupes")
+        self.run_btt.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
+        self.run_btt.set_sensitive(False)
+        self.run_btt.connect("clicked", self.run_button_clicked)
+        btt_box.pack_end(self.run_btt, False, True, 0)
+
+        self.pack_end(btt_box, False, True, 0)
+
+
+    def generate_option(self, checkbox, name, desc):
+        box = Gtk.Box(spacing=6)
+        box.add(checkbox)
+        
+        info = Gtk.Expander(label=name)
+        details = Gtk.Label(label=desc)
+        info.add(details)
+        box.add(info)
+        return box
+
+
+
+    def generate_command(self): 
+
+        command = ["jdupes"]
+        command.append("-q") #quiet
+        command.append("-S") #size
+        command.append("--order=name")
+
+        if self.opt_onefs.get_active():
+            command.append("-1")
+        if self.opt_nohidden.get_active():
+            command.append("-A")
+        if self.opt_hardlinks.get_active():
+            command.append("-H")
+        if self.opt_isolate.get_active():
+            command.append("-I")
+        if self.opt_permissions.get_active():
+            command.append("-p")
+        if self.opt_symlinks.get_active():
+            command.append("-s")
+        if self.opt_zeromatch.get_active():
+            command.append("-z")
+
+        recurse_dirs = []
+        no_recurse_dirs = []
+        for row in self.first_box.list_store: 
+            path = row[1]
+            if(os.path.isdir(path)):
+                if row[0]:
+                    recurse_dirs.append(path)
+                else:
+                    no_recurse_dirs.append(path)
+            else:
+                pass #should not happen since gtk dialog is set to select folder
+
+        for dir in no_recurse_dirs:
+            command.append(dir)
+
+        if len(recurse_dirs) != 0:
+            command.append("--recurse:")
+            for dir in recurse_dirs:
+                command.append(dir)
+
+        return command
+
+
+    def copy_command_button_clicked(self, widget):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        command = self.generate_command()
+        commandstring = ""
+        for arg in command:
+            commandstring += (arg + " ")
+        clipboard.set_text(commandstring, -1)
+
+
+    def run_button_clicked(self, widget): #TODO loading button, progress indicator, multithreading
+        
+        self.third_box.file_store.clear() 
+
+        command = self.generate_command()
+        fdup_out = subprocess.run(command, capture_output=True)
+        fdup_out_list = fdup_out.stdout.decode("utf-8").split('\n') #split rows and remove last newline always empty 
+        
+        list_of_lists = [] 
+        current_pack = []
+        for row in fdup_out_list:
+            if row == '':
+                if len(current_pack) != 0:
+                    list_of_lists.append(current_pack)
+                    current_pack = []
+            else:
+                current_pack.append(row)
+
+            
+        for pack in list_of_lists:
+            #filename = os.path.basename(pack[0])
+            parent = self.third_box.file_store.append(None, [False, pack[0]]) 
+
+            deleteflag = False
+            for row in pack[1:]:
+                self.third_box.file_store.append(parent, [deleteflag, row]) 
+                deleteflag = True
+        
+        self.third_box.file_view.expand_all() 
+        self.third_box.recalculate_duped_files_stats() 
+        self.third_box.update_delete_button_enable() 
+        self.third_box.update_select_all_enable() 
+        self.third_box.update_select_all_status()
+
+
+    def update_run_button_enable(self): 
+        if len(self.first_box.list_store) == 0:
+            self.run_btt.set_sensitive(False)
+            self.cp_cmd_btt.set_sensitive(False)
+        else:
+            self.run_btt.set_sensitive(True)
+            self.cp_cmd_btt.set_sensitive(True)
+
+
+
+class ThirdSection(Gtk.Box):
+    def __init__(self, mainwindow):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        self.mainwindow = mainwindow
+
+        topbar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        #topbar_box.props.margin_top = 4
+
+        self.select_all_skip_next_event = False
+        self.select_all = Gtk.CheckButton(label="Select all visible")
+        self.select_all.props.margin_left = 10
+        self.select_all.set_sensitive(False)
+        self.select_all.connect("toggled", self.on_select_all_toggled)
+        topbar_box.pack_start(self.select_all, False, True, 0)
+
+        self.search_string = ""
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.connect("search-changed", self.on_search_changed)
+        topbar_box.pack_end(self.search_entry, True, True, 0)
+
+        self.pack_start(topbar_box, False, True, 0)
+
+
+        self.file_store = Gtk.TreeStore(bool, str)
+
+        self.store_filter = self.file_store.filter_new()
+        self.store_filter.set_visible_func(self.search_filter_function)
+
+        self.file_view = Gtk.TreeView(model=self.store_filter)
+        self.file_view.get_selection().connect("changed", self.on_view_selection_changed)
+
+        file_view_toggle = Gtk.CellRendererToggle()
+        file_view_toggle.connect("toggled", self.on_cell_toggled)
+
+        view_toggle_column = Gtk.TreeViewColumn("Delete", file_view_toggle, active=0)
+        #output_view_column1.set_cell_data_func(output_view_toggle, self.set_checkbox_visibility)
+        self.file_view.append_column(view_toggle_column)
+
+        view_file_column = Gtk.TreeViewColumn("File", Gtk.CellRendererText(), text=1)
+        self.file_view.append_column(view_file_column)
+
+        file_view_scrollable = Gtk.ScrolledWindow()
+        file_view_scrollable.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        file_view_scrollable.add(self.file_view)
+
+        self.pack_start(file_view_scrollable, True, True, 0)
+
+        btt_box = Gtk.Box()
+
+        self.openfile_btt = Gtk.Button(label="Open file")
+        self.openfile_btt.connect("clicked", self.open_file_clicked)
+        self.openfile_btt.set_sensitive(False)
+        btt_box.pack_start(self.openfile_btt, False, True, 0)
+
+        self.openfilexplorer_btt = Gtk.Button(label="Open containing folder")
+        self.openfilexplorer_btt.connect("clicked", self.open_folder_clicked)
+        self.openfilexplorer_btt.set_sensitive(False)
+        btt_box.pack_start(self.openfilexplorer_btt, False, True, 0)
+
+        self.fileinfotext = Gtk.Label()
+        self.fileinfotext.set_label(files_and_size_to_string(0, 0))
+        self.fileinfotext.props.margin_left = 6
+        self.fileinfotext.props.margin_right = 6
+        btt_box.pack_start(self.fileinfotext, True, True, 0)
+
+        self.delselected_btt = Gtk.Button(label="Delete selected")
+        self.delselected_btt.get_style_context().add_class(Gtk.STYLE_CLASS_DESTRUCTIVE_ACTION)
+        self.delselected_btt.connect("clicked", self.delete_selected_clicked)
+        self.delselected_btt.set_sensitive(False)
+        btt_box.pack_end(self.delselected_btt, False, True, 0)
+
+        self.pack_end(btt_box, False, True, 0)
+
+
+    def search_filter_function(self, model, iter, data):
+        depth = model.get_path(iter).get_depth()
+
+        if depth == 1:
+            child_iter = model.iter_children(iter)
+
+            while child_iter != None:
+                if self.search_string in model[child_iter][1]:
+                    return True
+                child_iter = model.iter_next(child_iter)
+
+            return False
+
+        if self.search_string != "":
+            return self.search_string in model[iter][1]
+        else:
+            return True
+
+
+    def on_select_all_toggled(self, widget):
+        if self.select_all_skip_next_event:
+            self.select_all_skip_next_event = False
+            return 
+
+        model = self.store_filter
+        iter = model.get_iter_first()
+
+        newstatus = self.select_all.get_active()
+
+        while iter != None:
+            model[iter][0] = newstatus
+            child_iter = model.iter_children(iter) #get first child
+            while child_iter != None:
+                model[child_iter][0] = newstatus
+                child_iter = model.iter_next(child_iter)
+            iter = model.iter_next(iter)
+        
+        self.update_delete_button_enable()
+
+
+    def on_search_changed(self, *args):
+        self.search_string = self.search_entry.get_text().strip()
+        self.store_filter.refilter()
+        self.file_view.expand_all()
+        
+        self.update_model_parents()     
+        self.update_select_all_enable() 
+        self.update_select_all_status() 
+
+
+    def on_view_selection_changed(self, selection):
+        model, treeiter = selection.get_selected()
+        selectable = False
+        
+        if treeiter is not None:
+            depth = self.store_filter.get_path(treeiter).get_depth()
+            if depth == 2:
+                selectable = True
+
+        self.openfile_btt.set_sensitive(selectable)
+        self.openfilexplorer_btt.set_sensitive(selectable)
+
+
+    def on_cell_toggled(self, widget, path):
+        model = self.store_filter
+        model[path][0] = not model[path][0]
+        
+        depth = Gtk.TreePath(path).get_depth()
+        iter = model.get_iter(path)
+
+        if depth == 1: #if a parent node has been toggled -> toggle all its childs (files)
+            value_to_set = model[path][0]
+            child_iter = model.iter_children(iter)
+
+            while child_iter != None:
+                model[child_iter][0] = value_to_set
+                child_iter = model.iter_next(child_iter)
+
+        elif depth == 2: #if a child has been toggled -> check if all the files are checked -> if they are check the parent as well
+            #NOTE not using update model parents() since we only need to check one group and not update all the tree
+            are_all_set = True
+            parent_iter = model.iter_parent(iter)
+            child_iter = model.iter_children(parent_iter) #get first child
+
+            while child_iter != None:
+                if model[child_iter][0] == False:
+                    are_all_set = False
+                    break
+                child_iter = model.iter_next(child_iter)
+            
+            model[parent_iter][0] = are_all_set
+
+        self.update_delete_button_enable() 
+        self.update_select_all_status() 
+
+
+    def open_file_clicked(self, widget):
+        selection = self.file_view.get_selection()
+        tree, treeiter = selection.get_selected()
+        if treeiter is not None:
+            path = tree[treeiter][1]
+            args = ["xdg-open", path]
+            subprocess.run(args)
+
+    def open_folder_clicked(self, widget):
+        selection = self.file_view.get_selection()
+        tree, treeiter = selection.get_selected()
+        if treeiter is not None:
+            path = tree[treeiter][1]
+            folderpath = os.path.dirname(path)
+            args = ["xdg-open", folderpath]
+            subprocess.run(args)
+
+
+    def delete_selected_clicked(self, widget):
+        model = self.file_store
+        iter = model.get_iter_first()
+
+        filenames_to_be_del = []
+
+        number_of_files = 0
+        total_size_bytes = 0
+        deleting_whole_group = False
+
+        while iter != None:
+            this_group_all_selected = True #NOTE: have to do this beause parent nodes may have different values inside search
+            child_iter = model.iter_children(iter) #get first child
+
+            size_of_one_file = os.stat(model[child_iter][1]).st_size
+            number_of_selected_in_group = 0
+
+            while child_iter != None:
+
+                if model[child_iter][0] == True:
+                    filename = model[child_iter][1]
+                    filenames_to_be_del.append(filename)
+                    number_of_selected_in_group += 1
+                else:
+                    this_group_all_selected = False
+
+                child_iter = model.iter_next(child_iter)
+
+            number_of_files += number_of_selected_in_group
+            total_size_bytes += (size_of_one_file * number_of_selected_in_group)
+
+            if this_group_all_selected:
+                deleting_whole_group = True
+
+            iter = model.iter_next(iter)
+
+        #print(filenames_to_be_del)
+
+        message_type = Gtk.MessageType.QUESTION
+        if deleting_whole_group:
+            message_type = Gtk.MessageType.WARNING
+
+        primary_text = "Confirm Delete"
+        if deleting_whole_group:
+            primary_text = "Warning"
+
+        secondary_text = "Are you sure you want to delete " + files_and_size_to_string(number_of_files, total_size_bytes) + "?"
+        if deleting_whole_group:
+            secondary_text = "You are about to delete all the files in one or more groups.\n" + secondary_text
+ 
+        dialog = Gtk.MessageDialog(transient_for=self.mainwindow, message_type=message_type, text=primary_text, modal=True)
+        dialog.format_secondary_text(secondary_text)
+
+        cancel_btt = Gtk.Button(label="Cancel")
+
+        trash_btt = Gtk.Button(label="Move to trash")
+        trash_btt.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
+
+        delete_btt = Gtk.Button(label="Delete")
+        delete_btt.get_style_context().add_class(Gtk.STYLE_CLASS_DESTRUCTIVE_ACTION)
+
+        dialog.add_action_widget(cancel_btt, Gtk.ResponseType.CANCEL)
+        dialog.add_action_widget(trash_btt, Gtk.ResponseType.OK)
+        dialog.add_action_widget(delete_btt, Gtk.ResponseType.YES)
+
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.CANCEL:
+            return
+
+        for file in filenames_to_be_del:
+
+            if response == Gtk.ResponseType.OK:
+                print("gio trash " + file)
+                args = ["gio", "trash", file]
+                subprocess.run(args)
+
+            elif response == Gtk.ResponseType.YES:
+                print("rm " + file)
+                os.remove(file)
+                
+
+        #now remove entries from file storage
+        iter = model.get_iter_first()
+
+        while iter != None:
+            next_iter = model.iter_next(iter)
+            child_iter = model.iter_children(iter) #get first child
+
+            num_of_remaining_childs = 0
+
+            while child_iter != None:
+                next_child_iter = model.iter_next(child_iter)
+
+                if model[child_iter][0] == True:
+                    model.remove(child_iter)
+                else:
+                    num_of_remaining_childs += 1
+
+                child_iter = next_child_iter
+            
+            if num_of_remaining_childs <= 1: #no remaining duplicates, remove last child (if present) and parent
+                child_iter = model.iter_children(iter)
+                if child_iter is not None:
+                    model.remove(child_iter) #remove child if present
+                model.remove(iter) #remove parent
+            
+            iter = next_iter
+
+        self.recalculate_duped_files_stats() 
+        self.update_delete_button_enable() 
+        self.update_select_all_enable() 
+        self.update_select_all_status()
+
+
+    def recalculate_duped_files_stats(self):
+        model = self.file_store
+        iter = model.get_iter_first()
+
+        number_of_files = 0
+        total_size_bytes = 0
+
+        while iter != None:
+
+            n_children = model.iter_n_children(iter)
+            number_of_files += n_children
+            child_iter = model.iter_children(iter) #get first child
+            total_size_bytes += (os.stat(model[child_iter][1]).st_size * n_children) 
+
+            iter = model.iter_next(iter)
+        
+        self.fileinfotext.set_label(files_and_size_to_string(number_of_files, total_size_bytes))
+
+
+
+    '''
+    def set_checkbox_visibility(self, column, cell, model, iter, userData):
+        depth = model.get_path(iter).get_depth()
+
+        
+        if depth == 1 and self.output_search_string != "":
+            cell.set_property('sensitive', False) 
+        else:
+            cell.set_property('sensitive', True)
+        
+        cell.set_property('sensitive', True)
+    '''
+
+    def update_delete_button_enable(self):
+        model = self.file_store
+        iter = model.get_iter_first()
+
+        atleast_one_checked = False
+
+        while iter != None:
+            child_iter = model.iter_children(iter) #get first child
+            while child_iter != None:
+                if model[child_iter][0] == True:
+                    atleast_one_checked = True
+                    break
+                child_iter = model.iter_next(child_iter)
+            if atleast_one_checked:
+                break
+            iter = model.iter_next(iter)
+
+        self.delselected_btt.set_sensitive(atleast_one_checked)
+
+
+    def update_select_all_enable(self):
+        model = self.store_filter
+        if len(model) != 0:
+            self.select_all.set_sensitive(True)
+        else: 
+            self.select_all.set_sensitive(False)
+
+
+    def update_model_parents(self):
+        model = self.store_filter
+        iter = model.get_iter_first()
+
+        while iter != None:
+            are_all_set = True
+            child_iter = model.iter_children(iter) #get first child
+
+            while child_iter != None:
+                if model[child_iter][0] == False:
+                    are_all_set = False
+                    break
+                child_iter = model.iter_next(child_iter)
+
+            model[iter][0] = are_all_set
+
+            iter = model.iter_next(iter)
+
+
+    def update_select_all_status(self):
+        model = self.store_filter
+        iter = model.get_iter_first()
+
+        are_all_set = True
+        if iter == None: #empty tree
+            are_all_set = False
+
+        while iter != None:
+
+            if model[iter][0] == False:
+                are_all_set = False
+                break
+
+            iter = model.iter_next(iter)
+
+        if self.select_all.get_active() != are_all_set: #since changing state generates an event, signal to skip it
+            self.select_all_skip_next_event = True
+
+        self.select_all.set_active(are_all_set)
+
+
+
+
+class GfdupesWindow(Gtk.Window):
+    def __init__(self, _title):
+        super().__init__(title=_title)
+
+        self.connect("destroy", Gtk.main_quit)
+        self.set_size_request(700,400)
+        self.set_border_width(10)
+
+        mainbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(mainbox)
+
+        first_box = FirstSection(mainwindow=self)
+        third_box = ThirdSection(mainwindow=self)
+        second_box = SecondSection(first=first_box, third=third_box)
+        
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        #stack.set_transition_duration(350)
+
+        stack.add_titled(first_box, "first", "1. Input Folders")
+        stack.add_titled(second_box, "second", "2. Search Flags")
+        stack.add_titled(third_box, "third", "3. Duplicate FIles")
+
+        stack_switcher = Gtk.StackSwitcher()
+        stack_switcher.set_stack(stack)
+        stack_switcher.props.halign = Gtk.Align.CENTER
+        
+        mainbox.pack_start(stack_switcher, False, True, 0)
+        mainbox.pack_start(stack, True, True, 0)
+
+        self.show_all()
+
+    
+
+
+def main():  
+    exists = os.popen("which jdupes").read()
+
+    version = "jdupes-gui"
+    if exists:
+        version = os.popen("jdupes -v").read().split('\n')[0]
+    
+    window = GfdupesWindow(version)
+    
+    if not exists:
+        dialog = Gtk.MessageDialog(
+            transient_for=window,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="Jdupes is not installed",
+        )
+        dialog.format_secondary_text(
+            "Please install Jdupes using your distribution package manager.\nIf it is installed make sure it is accessible from command line."
+        )
+        dialog.run()
+        dialog.destroy()
+        exit()
+
+    Gtk.main()
+    
+    
+if __name__ == "__main__":
+    main()
