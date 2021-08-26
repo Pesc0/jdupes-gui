@@ -1,5 +1,5 @@
 # jdupes-gui
-A simpe yet complete gtk3 interface for github.com/jbruchon/jdupes
+A simple yet complete gtk3 interface for https://github.com/jbruchon/jdupes
 
 ## Dependencies
 You will need python3 and the pygobject library available from pip.
